@@ -1,6 +1,9 @@
 #include <iostream>
 #include <fstream>
 #include <vector>
+#include <iostream>
+#include <fstream>
+#include <vector>
 #include <cmath>
 #include <cassert>
 #include <locale>
@@ -480,7 +483,9 @@ public:
             exit(EXIT_FAILURE);
         }
 
-        load_boundary_conditions(ku1, ku2, ku3);
+        BoundaryConditionsLoader loader;
+        loader.loadbc(ku1, ku2, ku3);
+        bc = loader.bc;
     }
 
     void assemble_system() {
@@ -584,9 +589,8 @@ private:
         // Учет краевых условий 1-го рода (Дирихле)
         for (size_t i = 0; i < bc.kt1.size(); ++i) {
             int ind = bc.l1[i].first;
-            // Установка значения вектора решения
+            // Установка значения вектора правой части
             double u_val = ug(mesh.xy_x[ind], mesh.xy_y[ind], bc.kt1[i]);
-            solution[ind] = u_val;
 
             // Обнуление строки матрицы и установка диагонального элемента
             int row_start = matrix.A.row_ptr[ind];
@@ -652,6 +656,7 @@ private:
             }
         }
     }
+
 };
 
 int main() {
