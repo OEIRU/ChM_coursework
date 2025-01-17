@@ -4,12 +4,10 @@
 #include <cmath>
 #include <algorithm>
 #include <stdexcept>
-#include <locale>
-#include <unordered_map>
 
 constexpr int NUM_NODES_PER_ELEMENT = 9;
 constexpr int MAX_ITER = 100000;
-constexpr double EPSILON = 1e-8;  // Увеличено для улучшения устойчивости
+constexpr double EPSILON = 1e-12;
 
 struct CSRMatrix {
     int n, nnz;
@@ -71,71 +69,45 @@ double calculate_Ck(int i, int j, double x, double y) {
     return beta_func(x, y, 0) * phi_i * phi_j;
 }
 
-
 void loadnet(const std::string& filename, Mesh& mesh) {
     std::ifstream fp(filename);
     if (!fp) throw std::runtime_error("Ошибка открытия файла " + filename);
 
-    // Чтение количества узлов по x и y
     fp >> mesh.xwn;
-    fp >> mesh.ywn;
-
-    std::cout << "Количество узлов по x: " << mesh.xwn << "\n";
-    std::cout << "Количество узлов по y: " << mesh.ywn << "\n";
-
-    // Чтение координат узлов по x
     mesh.Xw.resize(mesh.xwn);
-    for (int i = 0; i < mesh.xwn; ++i) {
-        fp >> mesh.Xw[i];
-        std::cout << "Xw[" << i << "]: " << mesh.Xw[i] << "\n";
-    }
+    for (auto& x : mesh.Xw) fp >> x;
 
-    // Чтение координат узлов по y
+    fp >> mesh.ywn;
     mesh.Yw.resize(mesh.ywn);
-    for (int i = 0; i < mesh.ywn; ++i) {
-        fp >> mesh.Yw[i];
-        std::cout << "Yw[" << i << "]: " << mesh.Yw[i] << "\n";
-    }
+    for (auto& y : mesh.Yw) fp >> y;
 
-    // Чтение количества элементов
     fp >> mesh.L;
-    std::cout << "Количество элементов: " << mesh.L << "\n";
-
-    // Чтение индексов угловых узлов элементов
     mesh.W.resize(4, std::vector<int>(mesh.L));
     for (int i = 0; i < mesh.L; ++i) {
         for (int p = 0; p < 4; ++p) {
             fp >> mesh.W[p][i];
             if (mesh.W[p][i] > 0) mesh.W[p][i]--;
-            std::cout << "W[" << p << "][" << i << "]: " << mesh.W[p][i] << "\n";
         }
     }
 
-    // Количество узлов равно mesh.xwn * mesh.ywn
-    mesh.n = mesh.xwn * mesh.ywn;
-    std::cout << "Количество узлов (mesh.n): " << mesh.n << "\n";  // Отладочное сообщение
-
-    if (mesh.n <= 0) throw std::runtime_error("Некорректное количество узлов.");
+    mesh.n = (3 * mesh.xwn - 2) * (3 * mesh.ywn - 2);
     mesh.fict.assign(mesh.n, true);
     mesh.xy_x.resize(mesh.n);
     mesh.xy_y.resize(mesh.n);
 
-    // Вычисляем шаг сетки
-    double hx = (mesh.xwn > 1) ? (mesh.Xw[1] - mesh.Xw[0]) : 1.0;
-    double hy = (mesh.ywn > 1) ? (mesh.Yw[1] - mesh.Yw[0]) : 1.0;
-
-    std::cout << "hx: " << hx << ", hy: " << hy << "\n";  // Отладочное сообщение
-
-    if (hx <= 0 || hy <= 0) throw std::runtime_error("Нулевой или отрицательный шаг сетки.");
-
     int z_idx = 0;
     for (int i = 0; i < mesh.ywn; ++i) {
         for (int j = 0; j < mesh.xwn; ++j) {
-            // Вычисляем координаты узла
-            mesh.xy_x[z_idx] = mesh.Xw[j];
-            mesh.xy_y[z_idx] = mesh.Yw[i];
-            std::cout << "xy_x[" << z_idx << "]: " << mesh.xy_x[z_idx] << ", xy_y[" << z_idx << "]: " << mesh.xy_y[z_idx] << "\n";  // Отладочное сообщение
-            z_idx++;
+            double hx = (j < mesh.xwn - 1) ? (mesh.Xw[j + 1] - mesh.Xw[j]) : (mesh.Xw[j] - mesh.Xw[j - 1]);
+            double hy = (i < mesh.ywn - 1) ? (mesh.Yw[i + 1] - mesh.Yw[i]) : (mesh.Yw[i] - mesh.Yw[i - 1]);
+            for (int mi = 0; mi < 3; ++mi) {
+                for (int mj = 0; mj < 3; ++mj) {
+                    if (z_idx >= mesh.n) break;
+                    mesh.xy_x[z_idx] = mesh.Xw[j] + (mj / 2.0) * hx;
+                    mesh.xy_y[z_idx] = mesh.Yw[i] + (mi / 2.0) * hy;
+                    z_idx++;
+                }
+            }
         }
     }
 
@@ -148,19 +120,17 @@ void loadnet(const std::string& filename, Mesh& mesh) {
 
     mesh.nvkat.resize(mesh.k);
     mesh.nvtr.resize(mesh.k * NUM_NODES_PER_ELEMENT, -1);
+
     int elem_idx = 0;
     for (int p = 0; p < mesh.L; ++p) {
         for (int i = mesh.W[2][p]; i < mesh.W[3][p]; ++i) {
             for (int j = mesh.W[0][p]; j < mesh.W[1][p]; ++j) {
-                std::cout << "elem_idx: " << elem_idx << ", mesh.k: " << mesh.k << "\n";  // Отладочное сообщение
-                if (elem_idx >= mesh.k) throw std::runtime_error("Выход за пределы массива.");
+                if (elem_idx >= mesh.k) break;
                 mesh.nvkat[elem_idx] = p;
                 for (int m = 0; m < NUM_NODES_PER_ELEMENT; ++m) {
-                    int row = i + (m / 3);  // Убираем умножение на 3
-                    int col = j + (m % 3);  // Убираем умножение на 3
-                    int global_index = row * mesh.xwn + col;  // Используем mesh.xwn вместо (3 * mesh.xwn - 2)
-                    std::cout << "global_index: " << global_index << ", mesh.n: " << mesh.n << "\n";  // Отладочное сообщение
-                    if (row >= mesh.ywn || col >= mesh.xwn) {
+                    int row = i * 3 + (m / 3), col = j * 3 + (m % 3);
+                    int global_index = row * (3 * mesh.xwn - 2) + col;
+                    if (row >= (3 * mesh.ywn - 2) || col >= (3 * mesh.xwn - 2)) {
                         mesh.nvtr[elem_idx * NUM_NODES_PER_ELEMENT + m] = -1;
                         mesh.fict[global_index] = false;
                     } else {
@@ -243,80 +213,94 @@ void add_local_to_global(int ielem, const std::vector<double>& Ak, const std::ve
         }
         b[row] += Bk[i];
     }
-
-    // Дополнительные отладочные сообщения
-    if (ielem == 0) {
-        std::cout << "Первые 5 строк глобальной матрицы A:\n";
-        for (int i = 0; i < 5; ++i) {
-            for (int j = A.row_ptr[i]; j < A.row_ptr[i + 1]; ++j) {
-                std::cout << A.values[j] << " ";
-            }
-            std::cout << "\n";
-        }
-        std::cout << "Первые 5 значений вектора правой части b:\n";
-        for (int i = 0; i < 5; ++i) {
-            std::cout << b[i] << " ";
-        }
-        std::cout << "\n";
-    }
 }
 
-
+// Метод ЛОС для решения СЛАУ
 void LOS_solve(const CSRMatrix& A, const std::vector<double>& b, std::vector<double>& x, int max_iter, double tol) {
     int n = A.n;
     std::vector<double> r(n, 0.0), z(n, 0.0), p(n, 0.0), Ap(n, 0.0), Az(n, 0.0);
     x.assign(n, 0.0);
-    r = b;
+    
+    // Вычисляем начальный остаток r = b - Ax
+    for (int i = 0; i < n; ++i) {
+        r[i] = b[i];
+        for (int j = A.row_ptr[i]; j < A.row_ptr[i + 1]; ++j) {
+            r[i] -= A.values[j] * x[A.col_idx[j]];
+        }
+    }
+
+    // Вычисляем начальное значение z = M^(-1)r, где M = I для простоты
     z = r;
-    p = r;
+
+    // Начальная аппроксимация направления спуска p = z
+    p = z;
+
+    // Вычисляем норму начального остатка
     double r_norm = 0.0;
     for (int i = 0; i < n; ++i) r_norm += r[i] * r[i];
     r_norm = std::sqrt(r_norm);
+
     for (int iter = 0; iter < max_iter; ++iter) {
+        // Вычисляем Ap = A * p
         for (int i = 0; i < n; ++i) {
             Ap[i] = 0.0;
             for (int j = A.row_ptr[i]; j < A.row_ptr[i + 1]; ++j) {
                 Ap[i] += A.values[j] * p[A.col_idx[j]];
             }
         }
+
+        // Вычисляем скалярные произведения alpha и pAp
         double alpha = 0.0, pAp = 0.0;
         for (int i = 0; i < n; ++i) {
             alpha += r[i] * z[i];
             pAp += p[i] * Ap[i];
         }
+
         if (std::abs(pAp) < EPSILON) {
             throw std::runtime_error("pAp близко к нулю.");
         }
+
         alpha /= pAp;
+
+        // Обновляем решение x и остаток r
         for (int i = 0; i < n; ++i) {
             x[i] += alpha * p[i];
             r[i] -= alpha * Ap[i];
         }
+
+        // Вычисляем новую норму остатка
         double r_new_norm = 0.0;
         for (int i = 0; i < n; ++i) r_new_norm += r[i] * r[i];
         r_new_norm = std::sqrt(r_new_norm);
         std::cout << "Итерация " << iter + 1 << ": r_norm = " << r_new_norm << "\n";
+
         if (r_new_norm < tol * r_norm) {
             std::cout << "Сходимость за " << iter + 1 << " итераций.\n";
             break;
         }
+
+        // Обновляем z = M^(-1)r, где M = I для простоты
+        z = r;
+
+        // Вычисляем скалярные произведения beta и AzAz
+        double beta = 0.0, AzAz = 0.0;
         for (int i = 0; i < n; ++i) {
             Az[i] = 0.0;
             for (int j = A.row_ptr[i]; j < A.row_ptr[i + 1]; ++j) {
                 Az[i] += A.values[j] * z[A.col_idx[j]];
             }
-        }
-        double beta = 0.0, AzAz = 0.0;
-        for (int i = 0; i < n; ++i) {
             beta += r[i] * Az[i];
             AzAz += Az[i] * Az[i];
         }
+
         if (std::abs(AzAz) < EPSILON) {
             throw std::runtime_error("AzAz близко к нулю.");
         }
+
         beta /= AzAz;
+
+        // Обновляем направление спуска p
         for (int i = 0; i < n; ++i) {
-            z[i] = r[i] - beta * Az[i];
             p[i] = z[i] + beta * p[i];
         }
     }
@@ -367,21 +351,6 @@ void assemble_system(const Mesh& mesh, const BoundaryCondition& bc, CSRMatrix& A
             Bk[i] = f_func(element_x[i], element_y[i]) * k_area;
         }
 
-        // Отладочное сообщение: выводим локальную матрицу и вектор правой части
-        std::cout << "Локальная матрица Ak для элемента " << ielem << ":\n";
-        for (int i = 0; i < NUM_NODES_PER_ELEMENT; ++i) {
-            for (int j = 0; j < NUM_NODES_PER_ELEMENT; ++j) {
-                std::cout << Ak[i * NUM_NODES_PER_ELEMENT + j] << " ";
-            }
-            std::cout << "\n";
-        }
-
-        std::cout << "Локальный вектор правой части Bk для элемента " << ielem << ":\n";
-        for (int i = 0; i < NUM_NODES_PER_ELEMENT; ++i) {
-            std::cout << Bk[i] << " ";
-        }
-        std::cout << "\n";
-
         add_local_to_global(ielem, Ak, Bk, mesh, A, b);
     }
 
@@ -390,9 +359,6 @@ void assemble_system(const Mesh& mesh, const BoundaryCondition& bc, CSRMatrix& A
         int ind = bc.l1[i].first;
         if (ind < 0 || ind >= mesh.n) throw std::runtime_error("Некорректный индекс узла.");
         double u_val = bc.kt1_values[i];
-
-        // Отладочное сообщение: выводим изменения в глобальной матрице и векторе правой части
-        std::cout << "Применяем граничное условие Дирихле для узла " << ind << " со значением " << u_val << "\n";
 
         for (int j = A.row_ptr[ind]; j < A.row_ptr[ind + 1]; ++j) A.values[j] = 0.0;
         for (int j = A.row_ptr[ind]; j < A.row_ptr[ind + 1]; ++j) {
@@ -407,25 +373,32 @@ void assemble_system(const Mesh& mesh, const BoundaryCondition& bc, CSRMatrix& A
 int main() {
     try {
         std::setlocale(LC_ALL, "Russian");
+
         Mesh mesh;
         BoundaryCondition bc;
+
         loadnet("st.txt", mesh);
         loadbc("ku1.txt", bc.kt1, bc.l1, bc.kt1_values);
         loadbc("ku2.txt", bc.nvk2, bc.nvr2, bc.nvk2_values);
         loadbc("ku3.txt", bc.nvk3, bc.nvr3, bc.nvk3_values);
+
         CSRMatrix A(mesh.n);
         std::vector<double> b(mesh.n, 0.0);
         assemble_system(mesh, bc, A, b);
+
         std::vector<double> x(mesh.n, 0.0);
-        LOS_solve(A, b, x, MAX_ITER, EPSILON); 
+        LOS_solve(A, b, x, MAX_ITER, EPSILON);
+
         std::ofstream fp("q.txt");
         if (!fp) throw std::runtime_error("Ошибка открытия файла q.txt.");
         for (const auto& val : x) fp << val << "\t";
         fp.close();
+
         std::cout << "Решение записано в файл q.txt\n";
     } catch (const std::exception& e) {
         std::cerr << "Ошибка: " << e.what() << "\n";
         return EXIT_FAILURE;
     }
+
     return 0;
 }
