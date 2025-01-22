@@ -105,6 +105,21 @@ private:
 
 public:
 
+/*    void enforce_dirichlet() {
+    for (size_t i = 0; i < nodes.size(); ++i) {
+        if (!nodes[i].is_active) {
+            // Обнулить внедиагональные элементы строки
+            for (int j = matrix.row_ptr[i]; j < matrix.row_ptr[i+1]; ++j) {
+                matrix.lower[j] = 0.0;
+            }
+            // Диагональ = 1
+            matrix.diag[i] = 1.0;
+            // Правая часть = значению Дирихле
+            rhs[i] = solution[i];
+        }
+    }
+}
+*/
     void init_sparsity() {
         std::vector<std::unordered_map<int, double>> temp(nodes.size());
         
@@ -269,6 +284,8 @@ public:
     }
 }
 
+
+
     void assemble_system() {
         rhs.assign(nodes.size(), 0.0);
         matrix.diag.assign(nodes.size(), 0.0);
@@ -414,6 +431,8 @@ int main() {
     solver.init_sparsity();
     solver.apply_boundary_conditions();
     solver.assemble_system();
+    //solver.enforce_dirichlet();
+
     solver.solve();
     solver.save_results("results.csv");
 
