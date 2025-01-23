@@ -4,8 +4,6 @@
 #include <cmath>
 #include <algorithm>
 #include <unordered_map>
-#include <array> // Добавить в заголовки
-
 
 constexpr int BIQUAD_NODES = 9;
 constexpr int BILIN_NODES = 4;
@@ -17,19 +15,25 @@ const double gauss_weights[GAUSS_POINTS] = {5.0/9.0, 8.0/9.0, 5.0/9.0};
 
 struct Node {
     double x, y;
-    int bc_type;        // Тип краевого условия (целое)
-    double bc_value;    // Значение краевого условия
-    bool is_active;
-    int id;
-    
-    // Конструктор для правильной инициализации
-    Node(double x_, double y_, int bt, double bv, bool ia, int id_) 
-        : x(x_), y(y_), bc_type(bt), bc_value(bv), is_active(ia), id(id_) {}
+    int bc_type = 0;
+    double bc_value = 0.0;
+    bool is_active = true;
 };
 
 struct Element {
-    std::array<int, BIQUAD_NODES> nodes;
-    double gamma[BILIN_NODES]; // Коэффициенты γ в билинейных узлах
+    int nodes[BIQUAD_NODES];
+    double gamma[BILIN_NODES];
+};
+
+struct EdgeBC {
+    int node1, node2;
+    int func_id;
+    double beta = 0.0;
+};
+
+struct SolverParams {
+    int max_iter = 1000;
+    double tolerance = 1e-8;
 };
 
 struct SparseMatrix {
@@ -44,99 +48,97 @@ class FEMSolver {
 private:
     std::vector<Node> nodes;
     std::vector<Element> elements;
+    std::vector<EdgeBC> bc_first, bc_second, bc_third;
+    SolverParams params;
     SparseMatrix matrix;
     std::vector<double> rhs;
     std::vector<double> solution;
 
-    // Билинейные базисные функции
-    double bilinear_basis(double xi, double eta, int i) const {
+    double bilinear_basis(double xi, double eta, int i) {
         const double n[BILIN_NODES][2] = {{-1,-1}, {1,-1}, {1,1}, {-1,1}};
         return 0.25*(1 + xi*n[i][0])*(1 + eta*n[i][1]);
     }
 
-    // Биквадратичные базисные функции
-    double biquadratic_basis(double xi, double eta, int i) const {
+    double biquadratic_basis(double xi, double eta, int i) {
         const double n[BIQUAD_NODES][2] = {{-1,-1}, {1,-1}, {1,1}, {-1,1}, 
                                          {0,-1}, {1,0}, {0,1}, {-1,0}, {0,0}};
-        double x = n[i][0], y = n[i][1];
-        
-        if(i < 4) { // Угловые узлы
-            return 0.25*(1 + xi*x)*(1 + eta*y)*(xi*x + eta*y - 1);
-        } 
-        else if(i < 8) { // Реберные узлы
-            if(i % 2 == 0) // Вертикальные
-                return 0.5*(1 - xi*xi)*(1 + eta*y);
-            else // Горизонтальные
-                return 0.5*(1 - eta*eta)*(1 + xi*x);
-        } 
-        else { // Центральный узел
-            return (1 - xi*xi)*(1 - eta*eta);
-        }
+        if(i < 4) return 0.25*(xi*n[i][0] + 1)*(eta*n[i][1] + 1)*(xi*n[i][0] + eta*n[i][1] - 1);
+        if(i < 8) return 0.5*(1 - xi*xi)*(eta*n[i-4][1] + 1) + 0.5*(1 - eta*eta)*(xi*n[i-4][0] + 1);
+        return (1 - xi*xi)*(1 - eta*eta);
     }
 
-    // Градиенты биквадратичных функций
-    void biquadratic_grad(double xi, double eta, int i, double& dx, double& dy) const {
-        const double n[BIQUAD_NODES][2] = {{-1,-1}, {1,-1}, {1,1}, {-1,1}, 
-                                         {0,-1}, {1,0}, {0,1}, {-1,0}, {0,0}};
-        double x = n[i][0], y = n[i][1];
+    void biquadratic_grad(double xi, double eta, int i, double& dx, double& dy) {
+        const double eps = 1e-6;
+        dx = (biquadratic_basis(xi+eps, eta, i) - biquadratic_basis(xi-eps, eta, i))/(2*eps);
+        dy = (biquadratic_basis(xi, eta+eps, i) - biquadratic_basis(xi, eta-eps, i))/(2*eps);
+    }
+
+    std::vector<int> get_edge_nodes(int n1, int n2) {
+        const int edge_indices[4][3] = {{0, 4, 1}, {1, 5, 2}, {2, 6, 3}, {3, 7, 0}};
         
-        if(i < 4) {
-            dx = 0.25*x*(1 + eta*y)*(2*xi*x + eta*y);
-            dy = 0.25*y*(1 + xi*x)*(2*eta*y + xi*x);
-        }
-        else if(i < 8) {
-            if(i % 2 == 0) { // Вертикальные
-                dx = -xi*(1 + eta*y);
-                dy = 0.5*(1 - xi*xi)*y;
-            } else { // Горизонтальные
-                dx = 0.5*(1 - eta*eta)*x;
-                dy = -eta*(1 + xi*x);
+        for(const auto& elem : elements) {
+            for(int e = 0; e < 4; ++e) {
+                int a = elem.nodes[edge_indices[e][0]];
+                int b = elem.nodes[edge_indices[e][2]];
+                if((a == n1 && b == n2) || (a == n2 && b == n1)) {
+                    return {elem.nodes[edge_indices[e][0]],
+                            elem.nodes[edge_indices[e][1]],
+                            elem.nodes[edge_indices[e][2]]};
+                }
             }
         }
-        else { // Центральный
-            dx = -2*xi*(1 - eta*eta);
-            dy = -2*eta*(1 - xi*xi);
-        }
+        return {};
     }
 
-    // Вычисление якобиана
-    void jacobian(double xi, double eta, const Element& elem, 
-                 double J[2][2], double& detJ) const {
-        J[0][0] = J[0][1] = J[1][0] = J[1][1] = 0.0;
-        
-        for(int k = 0; k < BIQUAD_NODES; ++k) {
-            double dxi, deta;
-            biquadratic_grad(xi, eta, k, dxi, deta);
-            J[0][0] += dxi * nodes[elem.nodes[k]].x;
-            J[0][1] += dxi * nodes[elem.nodes[k]].y;
-            J[1][0] += deta * nodes[elem.nodes[k]].x;
-            J[1][1] += deta * nodes[elem.nodes[k]].y;
-        }
-        detJ = J[0][0]*J[1][1] - J[0][1]*J[1][0];
+    double calculate_edge_length(int n1, int n2) {
+        return std::hypot(nodes[n2].x - nodes[n1].x, nodes[n2].y - nodes[n1].y);
+    }
+
+    double get_dirichlet_value(int func_id, double x, double y) {
+        return x*x + y*y;
+    }
+
+    double get_neumann_value(int func_id) {
+        return -4.0;
     }
 
 public:
+    void enforce_dirichlet() {
+        for (size_t i = 0; i < nodes.size(); ++i) {
+            if (!nodes[i].is_active) {
+                for (int j = matrix.row_ptr[i]; j < matrix.row_ptr[i+1]; ++j) {
+                    matrix.lower[j] = 0.0;
+                }
+                matrix.diag[i] = 1.0;
+                rhs[i] = solution[i];
+            }
+        }
+    }
+
     void init_sparsity() {
-        std::vector<std::unordered_map<int, bool>> conn(nodes.size());
+        std::vector<std::unordered_map<int, double>> temp(nodes.size());
         
-        // Построение связей
         for(const auto& elem : elements) {
             for(int i = 0; i < BIQUAD_NODES; ++i) {
                 int row = elem.nodes[i];
+                if(!nodes[row].is_active) continue;
+                
                 for(int j = 0; j < BIQUAD_NODES; ++j) {
                     int col = elem.nodes[j];
-                    if(col <= row) conn[row].insert({col, true});
+                    if(!nodes[col].is_active || col > row) continue;
+                    temp[row][col] += 0.0;
                 }
             }
         }
         
-        // Формирование CSR формата
         matrix.size = nodes.size();
         matrix.row_ptr.push_back(0);
         for(int i = 0; i < matrix.size; ++i) {
             matrix.diag.push_back(0.0);
             std::vector<int> cols;
-            for(auto& p : conn[i]) cols.push_back(p.first);
+            for(const auto& pair : temp[i]) {
+                if(pair.first != i) cols.push_back(pair.first);
+            }
             std::sort(cols.begin(), cols.end());
             matrix.col_idx.insert(matrix.col_idx.end(), cols.begin(), cols.end());
             matrix.row_ptr.push_back(matrix.col_idx.size());
@@ -144,23 +146,91 @@ public:
         matrix.lower.resize(matrix.col_idx.size(), 0.0);
     }
 
-    void apply_boundary_conditions() {
-        // Проставляем флаги активных узлов
-        for(auto& node : nodes) {
-            node.is_active = (node.bc_type != 1);
+    void load_nodes(const std::string& filename) {
+        std::ifstream file(filename);
+        if (!file) {
+            std::cerr << "Error opening nodes file\n";
+            return;
+        }
+
+        double dummy;
+        int n_nodes;
+        file >> dummy >> dummy >> n_nodes;
+        
+        nodes.resize(n_nodes);
+        for(int i = 0; i < n_nodes; ++i) {
+            file >> nodes[i].x >> nodes[i].y;
         }
     }
 
-    void enforce_dirichlet() {
-        for(size_t i = 0; i < nodes.size(); ++i) {
-            if(nodes[i].bc_type == 1) {
-                // Обнуляем строку
-                matrix.diag[i] = 1.0;
-                for(int j = matrix.row_ptr[i]; j < matrix.row_ptr[i+1]; ++j)
-                    matrix.lower[j] = 0.0;
-                
-                // Правая часть
-                rhs[i] = nodes[i].bc_value;
+    void load_elems(const std::string& filename) {
+        std::ifstream file(filename);
+        if (!file) {
+            std::cerr << "Error opening elements file\n";
+            return;
+        }
+
+        int n_elems;
+        file >> n_elems;
+        elements.resize(n_elems);
+        
+        for(auto& elem : elements) {
+            for(int i = 0; i < BIQUAD_NODES; ++i) file >> elem.nodes[i];
+            for(int i = 0; i < BILIN_NODES; ++i) file >> elem.gamma[i];
+        }
+    }
+
+    void load_bc(const std::string& filename, int bc_type) {
+        std::ifstream file(filename);
+        if (!file) return;
+
+        int n_edges;
+        file >> n_edges;
+        
+        for(int i = 0; i < n_edges; ++i) {
+            EdgeBC bc;
+            file >> bc.node1 >> bc.node2 >> bc.func_id;
+            if(bc_type == 3) file >> bc.beta;
+            
+            auto& target = (bc_type == 1) ? bc_first : 
+                          (bc_type == 2) ? bc_second : bc_third;
+            target.push_back(bc);
+        }
+    }
+
+    void apply_boundary_conditions() {
+        solution.resize(nodes.size(), 0.0);
+        rhs.resize(nodes.size(), 0.0);
+
+        for(const auto& bc : bc_first) {
+            auto edge_nodes = get_edge_nodes(bc.node1, bc.node2);
+            if(edge_nodes.empty()) continue;
+
+            for(int node : edge_nodes) {
+                if(node < 0 || node >= nodes.size()) continue;
+                nodes[node].is_active = false;
+                solution[node] = get_dirichlet_value(bc.func_id, nodes[node].x, nodes[node].y);
+            }
+        }
+
+        for (const auto& bc : bc_second) {
+            auto edge_nodes = get_edge_nodes(bc.node1, bc.node2);
+            if (edge_nodes.empty()) continue;
+
+            double theta = get_neumann_value(bc.func_id);
+            double length = calculate_edge_length(edge_nodes[0], edge_nodes[2]);
+
+            for(int gi = 0; gi < GAUSS_POINTS; ++gi) {
+                double xi = gauss_points[gi];
+                double weight = gauss_weights[gi];
+                double N[3] = {0.5*xi*(xi-1), 1.0-xi*xi, 0.5*xi*(xi+1)};
+
+                for(int i = 0; i < 3; ++i) {
+                    int node = edge_nodes[i];
+                    if(node >= 0 && node < nodes.size() && nodes[node].is_active) {
+                        rhs[node] += theta * N[i] * weight * (length/2.0);
+                    }
+                }
             }
         }
     }
@@ -174,19 +244,29 @@ public:
             double Ke[BIQUAD_NODES][BIQUAD_NODES] = {0};
             double Fe[BIQUAD_NODES] = {0};
 
-            // Интегрирование по Гауссу
             for(int gi = 0; gi < GAUSS_POINTS; ++gi) {
                 for(int gj = 0; gj < GAUSS_POINTS; ++gj) {
                     double xi = gauss_points[gi];
                     double eta = gauss_points[gj];
                     double w = gauss_weights[gi] * gauss_weights[gj];
 
-                    // Якобиан
-                    double J[2][2], detJ;
-                    jacobian(xi, eta, elem, J, detJ);
-                    detJ = fabs(detJ);
+                    double J[2][2] = {0};
+                    for(int k = 0; k < BIQUAD_NODES; ++k) {
+                        double dx, dy;
+                        biquadratic_grad(xi, eta, k, dx, dy);
+                        J[0][0] += dx * nodes[elem.nodes[k]].x;
+                        J[0][1] += dx * nodes[elem.nodes[k]].y;
+                        J[1][0] += dy * nodes[elem.nodes[k]].x;
+                        J[1][1] += dy * nodes[elem.nodes[k]].y;
+                    }
+                    double detJ = J[0][0]*J[1][1] - J[0][1]*J[1][0];
+                    if(detJ < EPS) detJ = EPS;
 
-                    // Градиенты базисных функций
+                    double gamma = 0.0;
+                    for(int k = 0; k < BILIN_NODES; ++k) {
+                        gamma += elem.gamma[k] * bilinear_basis(xi, eta, k);
+                    }
+
                     double dN[BIQUAD_NODES][2];
                     for(int k = 0; k < BIQUAD_NODES; ++k) {
                         double dxi, deta;
@@ -195,35 +275,26 @@ public:
                         dN[k][1] = (-J[1][0]*dxi + J[0][0]*deta)/detJ;
                     }
 
-                    // Коэффициент γ (билинейная интерполяция)
-                    double gamma = 0.0;
-                    for(int k = 0; k < BILIN_NODES; ++k)
-                        gamma += elem.gamma[k] * bilinear_basis(xi, eta, k);
-
-                    // Вклад в матрицу и вектор
                     for(int i = 0; i < BIQUAD_NODES; ++i) {
                         for(int j = 0; j < BIQUAD_NODES; ++j) {
-                            Ke[i][j] += (dN[i][0]*dN[j][0] + dN[i][1]*dN[j][1]
-                                      + gamma * biquadratic_basis(xi,eta,i) 
-                                              * biquadratic_basis(xi,eta,j))
-                                      * w * detJ;
+                            Ke[i][j] += (dN[i][0]*dN[j][0] + dN[i][1]*dN[j][1] +
+                                       gamma * biquadratic_basis(xi,eta,i) * 
+                                       biquadratic_basis(xi,eta,j)) * w * std::abs(detJ);
                         }
-                        Fe[i] += (-4.0) * biquadratic_basis(xi,eta,i) * w * detJ;
+                        Fe[i] += (-4.0) * biquadratic_basis(xi, eta, i) * w * std::abs(detJ);
                     }
                 }
             }
 
-            // Сборка в глобальную систему
             for(int i = 0; i < BIQUAD_NODES; ++i) {
                 int row = elem.nodes[i];
                 if(!nodes[row].is_active) continue;
-
-                rhs[row] += Fe[i];
                 
+                rhs[row] += Fe[i];
                 for(int j = 0; j < BIQUAD_NODES; ++j) {
                     int col = elem.nodes[j];
                     if(col > row || !nodes[col].is_active) continue;
-
+                    
                     if(col == row) {
                         matrix.diag[row] += Ke[i][j];
                     } else {
@@ -232,8 +303,10 @@ public:
                             matrix.col_idx.begin() + matrix.row_ptr[row+1],
                             col
                         );
-                        int idx = it - matrix.col_idx.begin();
-                        matrix.lower[idx] += Ke[i][j];
+                        if(it != matrix.col_idx.begin() + matrix.row_ptr[row+1] && *it == col) {
+                            int idx = it - matrix.col_idx.begin();
+                            matrix.lower[idx] += Ke[i][j];
+                        }
                     }
                 }
             }
@@ -241,94 +314,80 @@ public:
     }
 
     void solve() {
-        int n = nodes.size();
-        solution.assign(n, 0.0);
+        solution.resize(nodes.size(), 0.0);
         std::vector<double> r = rhs;
         std::vector<double> p = r;
-        std::vector<double> Ap(n, 0.0);
-        double rsold = 0.0;
+        std::vector<double> Ap(nodes.size(), 0.0);
 
-        for(int i = 0; i < n; ++i) rsold += r[i]*r[i];
-
-        for(int iter = 0; iter < 1000; ++iter) {
-            // Ap = A*p
+        double rr_old = 0.0;
+        for(int iter = 0; iter < params.max_iter; ++iter) {
             std::fill(Ap.begin(), Ap.end(), 0.0);
-            for(int i = 0; i < n; ++i) {
+            for(int i = 0; i < matrix.size; ++i) {
+                if (!nodes[i].is_active) continue;
                 Ap[i] += matrix.diag[i] * p[i];
                 for(int j = matrix.row_ptr[i]; j < matrix.row_ptr[i+1]; ++j) {
                     Ap[i] += matrix.lower[j] * p[matrix.col_idx[j]];
-                    Ap[matrix.col_idx[j]] += matrix.lower[j] * p[i];
+                    if (matrix.col_idx[j] < i && nodes[matrix.col_idx[j]].is_active) {
+                        Ap[matrix.col_idx[j]] += matrix.lower[j] * p[i];
+                    }
                 }
             }
 
-            // alpha = rsold / (p'*Ap)
-            double alpha = 0.0, pAp = 0.0;
-            for(int i = 0; i < n; ++i) {
-                alpha += r[i] * r[i];
+            double pAp = 0.0, rr = 0.0;
+            for(size_t i = 0; i < r.size(); ++i) {
+                if (!nodes[i].is_active) continue;
+                rr += r[i] * r[i];
                 pAp += p[i] * Ap[i];
             }
-            if(fabs(pAp) < 1e-12) break;
-            alpha /= pAp;
+            if (std::abs(pAp) < EPS) break;
+            double alpha = rr / pAp;
 
-            // Обновление решения и невязки
-            for(int i = 0; i < n; ++i) {
+            for(size_t i = 0; i < solution.size(); ++i) {
+                if (!nodes[i].is_active) continue;
                 solution[i] += alpha * p[i];
                 r[i] -= alpha * Ap[i];
             }
 
-            // Проверка сходимости
-            double rsnew = 0.0;
-            for(int i = 0; i < n; ++i) rsnew += r[i] * r[i];
-            if(sqrt(rsnew) < 1e-8) break;
+            double rr_new = 0.0;
+            for(double val : r) rr_new += val * val;
+            if (std::sqrt(rr_new) < params.tolerance) {
+                std::cout << "Converged in " << iter << " iterations\n";
+                break;
+            }
 
-            // Обновление направления
-            double beta = rsnew / rsold;
-            rsold = rsnew;
-            for(int i = 0; i < n; ++i) 
+            double beta = rr_new / rr;
+            for(size_t i = 0; i < p.size(); ++i) {
+                if (!nodes[i].is_active) continue;
                 p[i] = r[i] + beta * p[i];
+            }
+            rr_old = rr_new;
         }
     }
 
     void save_results(const std::string& filename) {
         std::ofstream file(filename);
         file << "x,y,u\n";
-        for(const auto& node : nodes) {
-            file << node.x << "," << node.y << "," << solution[node.id] << "\n";
+        for(size_t i = 0; i < nodes.size(); ++i) {
+            file << nodes[i].x << "," << nodes[i].y << "," << solution[i] << "\n";
         }
-    }
-
-    // Загрузка тестовых данных
-    void load_test_data() {
-    nodes = {
-        Node(0.0, 0.0, 1, 0.0, false, 0),
-        Node(2.0, 0.0, 1, 8.0, false, 1),
-        Node(2.0, 2.0, 1, 16.0, false, 2),
-        Node(0.0, 2.0, 1, 8.0, false, 3),
-        Node(1.0, 0.0, 0, 2.0, true, 4),
-        Node(2.0, 1.0, 0, 10.0, true, 5),
-        Node(1.0, 2.0, 0, 10.0, true, 6),
-        Node(0.0, 1.0, 3, -7.21762, true, 7), 
-        Node(1.0, 1.0, 0, 11.0671, true, 8)
-    };
-
-    Element elem;
-    elem.nodes = {0,1,2,3,4,5,6,7,8}; // Теперь работает с std::array
-    for(int i = 0; i < BILIN_NODES; ++i) elem.gamma[i] = 1.0;
-    elements.push_back(elem);
     }
 };
 
 int main() {
     FEMSolver solver;
-    solver.load_test_data();
+    
+    solver.load_nodes("nodes.txt");
+    solver.load_elems("elems.txt");
+    solver.load_bc("first.txt", 1);
+    solver.load_bc("second.txt", 2);
+    solver.load_bc("third.txt", 3);
     
     solver.init_sparsity();
     solver.apply_boundary_conditions();
-    solver.assemble_system();
     solver.enforce_dirichlet();
+    solver.assemble_system();
     solver.solve();
     solver.save_results("results.csv");
 
-    std::cout << "Решение сохранено в results.csv" << std::endl;
     return 0;
 }

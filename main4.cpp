@@ -366,50 +366,61 @@ public:
         }
     }
 
-    void solve() {
-        solution.resize(nodes.size(), 0.0);
-        std::vector<double> r = rhs;
-        std::vector<double> p = r;
-        std::vector<double> Ap(nodes.size(), 0.0);
+void solve() {
+    solution.resize(nodes.size(), 0.0);
+    std::vector<double> r = rhs;
+    std::vector<double> p = r;
+    std::vector<double> Ap(nodes.size(), 0.0);
 
-        for(int iter = 0; iter < params.max_iter; ++iter) {
-            // Ap = A*p
-            std::fill(Ap.begin(), Ap.end(), 0.0);
-            for(int i = 0; i < matrix.size; ++i) {
-                Ap[i] += matrix.diag[i] * p[i];
-                for(int j = matrix.row_ptr[i]; j < matrix.row_ptr[i+1]; ++j) {
-                    Ap[i] += matrix.lower[j] * p[matrix.col_idx[j]];
+    double rr_old = 0.0;
+    for(int iter = 0; iter < params.max_iter; ++iter) {
+        // Ap = A*p
+        std::fill(Ap.begin(), Ap.end(), 0.0);
+        for(int i = 0; i < matrix.size; ++i) {
+            if (!nodes[i].is_active) continue; // Учёт граничных условий
+            Ap[i] += matrix.diag[i] * p[i];
+            for(int j = matrix.row_ptr[i]; j < matrix.row_ptr[i+1]; ++j) {
+                Ap[i] += matrix.lower[j] * p[matrix.col_idx[j]];
+                if (matrix.col_idx[j] < i && nodes[matrix.col_idx[j]].is_active) {
                     Ap[matrix.col_idx[j]] += matrix.lower[j] * p[i];
                 }
             }
-
-            double alpha = 0.0, pAp = 0.0;
-            for(size_t i = 0; i < r.size(); ++i) {
-                alpha += r[i] * r[i];
-                pAp += p[i] * Ap[i];
-            }
-            if(std::abs(pAp) < EPS) break;
-            alpha /= pAp;
-
-            for(size_t i = 0; i < solution.size(); ++i) {
-                solution[i] += alpha * p[i];
-                r[i] -= alpha * Ap[i];
-            }
-
-            double rr = 0.0;
-            for(double val : r) rr += val*val;
-            if(std::sqrt(rr) < params.tolerance) {
-                std::cout << "Converged in " << iter << " iterations\n";
-                break;
-            }
-
-            double beta = rr / (alpha * pAp);
-            for(size_t i = 0; i < p.size(); ++i) {
-                p[i] = r[i] + beta * p[i];
-            }
         }
-    }
 
+        // Вычисление alpha
+        double pAp = 0.0, rr = 0.0;
+        for(size_t i = 0; i < r.size(); ++i) {
+            if (!nodes[i].is_active) continue;
+            rr += r[i] * r[i];
+            pAp += p[i] * Ap[i];
+        }
+        if (std::abs(pAp) < EPS) break;
+        double alpha = rr / pAp;
+
+        // Обновление решения и невязки
+        for(size_t i = 0; i < solution.size(); ++i) {
+            if (!nodes[i].is_active) continue;
+            solution[i] += alpha * p[i];
+            r[i] -= alpha * Ap[i];
+        }
+
+        // Проверка сходимости
+        double rr_new = 0.0;
+        for(double val : r) rr_new += val * val;
+        if (std::sqrt(rr_new) < params.tolerance) {
+            std::cout << "Сходимость за " << iter << " итераций\n";
+            break;
+        }
+
+        // Вычисление beta
+        double beta = rr_new / rr;
+        for(size_t i = 0; i < p.size(); ++i) {
+            if (!nodes[i].is_active) continue;
+            p[i] = r[i] + beta * p[i];
+        }
+        rr_old = rr_new;
+    }
+}
     void save_results(const std::string& filename) {
         std::ofstream file(filename);
         file << "x,y,u\n";
