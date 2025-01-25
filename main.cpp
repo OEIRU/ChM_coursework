@@ -3,429 +3,573 @@
 #include <vector>
 #include <cmath>
 #include <algorithm>
-#include <stdexcept>
-#include <locale>
-#include <unordered_map>
+#include <set>  // Используется для эффективного хранения уникальных индексов столбцов
+#include <clocale>
 
-constexpr int NUM_NODES_PER_ELEMENT = 9;
-constexpr int MAX_ITER = 100000;
-constexpr double EPSILON = 1e-8;  // Увеличено для улучшения устойчивости
+// Константы, определяющие параметры задачи
+constexpr int BIQUAD_NODES = 9;      // Количество узлов в биквадратичном элементе
+constexpr int BILIN_NODES = 4;       // Количество узлов в билинейном элементе
+constexpr int GAUSS_POINTS = 3;      // Количество точек интегрирования Гаусса
+constexpr double EPS = 1e-12;        // Малая величина для проверки на нуль
 
-struct CSRMatrix {
-    int n, nnz;
-    std::vector<double> values;
-    std::vector<int> col_idx, row_ptr;
+// Точки и веса квадратуры Гаусса (3 точки)
+const double gauss_points[GAUSS_POINTS] = { -0.7745966692, 0.0, 0.7745966692 };
+const double gauss_weights[GAUSS_POINTS] = { 5.0 / 9.0, 8.0 / 9.0, 5.0 / 9.0 };
 
-    CSRMatrix(int size = 0) : n(size), nnz(0), row_ptr(size + 1, 0) {}
+// Структура, описывающая узел сетки
+struct Node {
+    double x, y;            // Координаты узла
+    int bc_type = 0;        // Тип граничного условия (0 - внутренний узел)
+    double bc_value = 0.0;  // Значение граничного условия
+    bool is_active = true;  // Флаг активности узла (используется для Дирихле)
 };
 
-struct Mesh {
-    int xwn, ywn, L, n, k;
-    std::vector<double> Xw, Yw, xy_x, xy_y;
-    std::vector<std::vector<int>> W;
-    std::vector<int> nvkat, nvtr;
-    std::vector<bool> fict;
+// Структура, описывающая конечный элемент
+struct Element {
+    int nodes[BIQUAD_NODES]; // Индексы узлов элемента
+    double gamma[BILIN_NODES]; // Параметры материала (например, теплопроводность)
 };
 
-struct BoundaryCondition {
-    std::vector<int> kt1, nvk2, nvk3;
-    std::vector<std::pair<int, int>> l1, nvr2, nvr3;
-    std::vector<double> kt1_values, nvk2_values, nvk3_values;
+// Структура для хранения граничных условий на ребре
+struct EdgeBC {
+    int node1, node2;       // Индексы узлов, образующих ребро
+    int func_id;            // Идентификатор функции для вычисления значения
+    double beta = 0.0;      // Параметр для условий Робина (beta)
+    double value = 0.0;     // Значение граничного условия
 };
 
-double lambda_func(double x, double y) { return 1.0; }
-double gamma_func(double x, double y) { return 0.0; }
-double f_func(double x, double y) { return -6.0 * x - 6.0 * y; }
-double ug(double x, double y, int index) { return std::pow(x, 3) + std::pow(y, 3); }
-double teta(double x, double y, int index) { return 0.0; }
-double beta_func(double x, double y, int index) { return 1.0; }
-double u_beta_func(double x, double y, int index) { return 0.0; }
+// Параметры solve  и допустимая погрешность)
+struct SolverParams {
+    int max_iter = 100000;  // Макс. итераций
+    double tolerance = 1e-8;// Допустимая погрешность
+};
 
-double bilinear_basis_function(double xi, double eta, int i) {
-    switch (i) {
-        case 0: return 0.25 * (1 - xi) * (1 - eta);
-        case 1: return 0.25 * (1 + xi) * (1 - eta);
-        case 2: return 0.25 * (1 + xi) * (1 + eta);
-        case 3: return 0.25 * (1 - xi) * (1 + eta);
-        default: throw std::runtime_error("Invalid basis function index.");
-    }
-}
+// Структура для хранения разреженной матрицы в формате CSR
+struct SparseMatrix {
+    std::vector<double> diag;    // Диагональные элементы
+    std::vector<double> lower;   // Нижние внедиагональные элементы
+    std::vector<int> row_ptr;    // Указатели на начало строк в col_idx
+    std::vector<int> col_idx;    // Индексы столбцов для нижних элементов
+    int size;                    // Размер матрицы (size x size)
+};
 
-double calculate_G(int i, int j, double x, double y) {
-    double grad_phi_i_x = (i % 3 == 0) ? -1.0 : ((i % 3 == 1) ? 0.0 : 1.0);
-    double grad_phi_i_y = (i / 3 == 0) ? -1.0 : ((i / 3 == 1) ? 0.0 : 1.0);
-    double grad_phi_j_x = (j % 3 == 0) ? -1.0 : ((j % 3 == 1) ? 0.0 : 1.0);
-    double grad_phi_j_y = (j / 3 == 0) ? -1.0 : ((j / 3 == 1) ? 0.0 : 1.0);
-    return lambda_func(x, y) * (grad_phi_i_x * grad_phi_j_x + grad_phi_i_y * grad_phi_j_y);
-}
+// Класс, реализующий МКЭ-решатель
+class FEMSolver {
+private:
+    std::vector<Node> nodes;         // Список узлов
+    std::vector<Element> elements;   // Список элементов
+    std::vector<EdgeBC> bc_first,    // Граничные условия 1-го рода (Дирихле)
+        bc_second,    // Граничные условия 2-го рода (Неймана)
+        bc_third;     // Граничные условия 3-го рода (Робин)
+    SolverParams params;             // Параметры решателя
+    SparseMatrix matrix;             // Разреженная матрица СЛАУ
+    std::vector<double> rhs;         // Вектор правой части
+    std::vector<double> solution;    // Вектор решения
 
-double calculate_C(int i, int j, double x, double y) {
-    double phi_i = (i % 3 == 0) ? 1.0 : ((i % 3 == 1) ? 0.0 : 1.0);
-    double phi_j = (j % 3 == 0) ? 1.0 : ((j % 3 == 1) ? 0.0 : 1.0);
-    return gamma_func(x, y) * phi_i * phi_j;
-}
-
-double calculate_Ck(int i, int j, double x, double y) {
-    double phi_i = (i % 3 == 0) ? 1.0 : ((i % 3 == 1) ? 0.0 : 1.0);
-    double phi_j = (j % 3 == 0) ? 1.0 : ((j % 3 == 1) ? 0.0 : 1.0);
-    return beta_func(x, y, 0) * phi_i * phi_j;
-}
-
-
-void loadnet(const std::string& filename, Mesh& mesh) {
-    std::ifstream fp(filename);
-    if (!fp) throw std::runtime_error("Ошибка открытия файла " + filename);
-
-    // Чтение количества узлов по x и y
-    fp >> mesh.xwn;
-    fp >> mesh.ywn;
-
-    std::cout << "Количество узлов по x: " << mesh.xwn << "\n";
-    std::cout << "Количество узлов по y: " << mesh.ywn << "\n";
-
-    // Чтение координат узлов по x
-    mesh.Xw.resize(mesh.xwn);
-    for (int i = 0; i < mesh.xwn; ++i) {
-        fp >> mesh.Xw[i];
-        std::cout << "Xw[" << i << "]: " << mesh.Xw[i] << "\n";
+    // Билинейные базисные функции (для 4-узловых элементов)
+    double bilinear_basis(double xi, double eta, int i) {
+        const double n[BILIN_NODES][2] = { {-1,-1}, {1,-1}, {1,1}, {-1,1} };
+        return 0.25 * (1 + xi * n[i][0]) * (1 + eta * n[i][1]);
     }
 
-    // Чтение координат узлов по y
-    mesh.Yw.resize(mesh.ywn);
-    for (int i = 0; i < mesh.ywn; ++i) {
-        fp >> mesh.Yw[i];
-        std::cout << "Yw[" << i << "]: " << mesh.Yw[i] << "\n";
+    // Биквадратичные базисные функции (для 9-узловых элементов)
+    double biquadratic_basis(double xi, double eta, int i) {
+        const double n[BIQUAD_NODES][2] = { {-1,-1}, {1,-1}, {1,1}, {-1,1},
+                                         {0,-1}, {1,0}, {0,1}, {-1,0}, {0,0} };
+        if (i < 4) // Угловые узлы
+            return 0.25 * (xi * n[i][0] + 1) * (eta * n[i][1] + 1) * (xi * n[i][0] + eta * n[i][1] - 1);
+        if (i < 8) // Средние узлы ребер
+            return 0.5 * (1 - xi * xi) * (eta * n[i - 4][1] + 1) + 0.5 * (1 - eta * eta) * (xi * n[i - 4][0] + 1);
+        return (1 - xi * xi) * (1 - eta * eta); // Центральный узел
     }
 
-    // Чтение количества элементов
-    fp >> mesh.L;
-    std::cout << "Количество элементов: " << mesh.L << "\n";
+    // Вычисление градиентов биквадратичных функций
+    void biquadratic_grad(double xi, double eta, int i, double& dx, double& dy) {
+        const double n[BIQUAD_NODES][2] = { {-1,-1}, {1,-1}, {1,1}, {-1,1},
+                                          {0,-1}, {1,0}, {0,1}, {-1,0}, {0,0} };
 
-    // Чтение индексов угловых узлов элементов
-    mesh.W.resize(4, std::vector<int>(mesh.L));
-    for (int i = 0; i < mesh.L; ++i) {
-        for (int p = 0; p < 4; ++p) {
-            fp >> mesh.W[p][i];
-            if (mesh.W[p][i] > 0) mesh.W[p][i]--;
-            std::cout << "W[" << p << "][" << i << "]: " << mesh.W[p][i] << "\n";
+        if (i < 4) { // Угловые узлы
+            double xi_i = n[i][0], eta_i = n[i][1];
+            dx = 0.25 * (eta_i + 1) * (2 * xi * xi_i + eta_i * eta - 1);
+            dy = 0.25 * (xi_i + 1) * (2 * eta * eta_i + xi_i * xi - 1);
+        }
+        else if (i < 8) { // Средние узлы ребер
+            int k = i - 4;
+            if (k % 2 == 0) { // Вертикальные ребра (xi = const)
+                dx = -xi * (1 + n[k][1] * eta);
+                dy = 0.5 * (1 - xi * xi) * n[k][1];
+            }
+            else { // Горизонтальные ребра (eta = const)
+                dx = 0.5 * (1 - eta * eta) * n[k][0];
+                dy = -eta * (1 + n[k][0] * xi);
+            }
+        }
+        else { // Центральный узел
+            dx = -2 * xi * (1 - eta * eta);
+            dy = -2 * eta * (1 - xi * xi);
+        }
+
+        // Проверка на NaN (некорректные вычисления)
+        if (std::isnan(dx) || std::isnan(dy)) {
+            std::cerr << "Ошибка: Нечисловое значение в градиенте! Узел: " << i
+                << " Координаты: (" << xi << ", " << eta << ")\n";
+            exit(1);
         }
     }
 
-    // Количество узлов равно mesh.xwn * mesh.ywn
-    mesh.n = mesh.xwn * mesh.ywn;
-    std::cout << "Количество узлов (mesh.n): " << mesh.n << "\n";  // Отладочное сообщение
+    // Поиск узлов, принадлежащих ребру (n1, n2)
+    std::vector<int> get_edge_nodes(int n1, int n2) {
+        const int edge_indices[4][3] = { {0,4,1}, {1,5,2}, {2,6,3}, {3,7,0} };
 
-    if (mesh.n <= 0) throw std::runtime_error("Некорректное количество узлов.");
-    mesh.fict.assign(mesh.n, true);
-    mesh.xy_x.resize(mesh.n);
-    mesh.xy_y.resize(mesh.n);
+        // Поиск в стандартных ребрах элементов
+        for (const auto& elem : elements) {
+            for (int e = 0; e < 4; ++e) {
+                int a = elem.nodes[edge_indices[e][0]];
+                int mid = elem.nodes[edge_indices[e][1]];
+                int b = elem.nodes[edge_indices[e][2]];
 
-    // Вычисляем шаг сетки
-    double hx = (mesh.xwn > 1) ? (mesh.Xw[1] - mesh.Xw[0]) : 1.0;
-    double hy = (mesh.ywn > 1) ? (mesh.Yw[1] - mesh.Yw[0]) : 1.0;
+                // Проверка ребра в обоих направлениях
+                if ((a == n1 && b == n2) || (a == n2 && b == n1)) {
+                    return { a, mid, b }; // Возврат узлов ребра
+                }
+            }
 
-    std::cout << "hx: " << hx << ", hy: " << hy << "\n";  // Отладочное сообщение
-
-    if (hx <= 0 || hy <= 0) throw std::runtime_error("Нулевой или отрицательный шаг сетки.");
-
-    int z_idx = 0;
-    for (int i = 0; i < mesh.ywn; ++i) {
-        for (int j = 0; j < mesh.xwn; ++j) {
-            // Вычисляем координаты узла
-            mesh.xy_x[z_idx] = mesh.Xw[j];
-            mesh.xy_y[z_idx] = mesh.Yw[i];
-            std::cout << "xy_x[" << z_idx << "]: " << mesh.xy_x[z_idx] << ", xy_y[" << z_idx << "]: " << mesh.xy_y[z_idx] << "\n";  // Отладочное сообщение
-            z_idx++;
-        }
-    }
-
-    mesh.k = 0;
-    for (int p = 0; p < mesh.L; ++p) {
-        int x_start = mesh.W[0][p], x_end = mesh.W[1][p];
-        int y_start = mesh.W[2][p], y_end = mesh.W[3][p];
-        mesh.k += (x_end - x_start) * (y_end - y_start);
-    }
-
-    mesh.nvkat.resize(mesh.k);
-    mesh.nvtr.resize(mesh.k * NUM_NODES_PER_ELEMENT, -1);
-    int elem_idx = 0;
-    for (int p = 0; p < mesh.L; ++p) {
-        for (int i = mesh.W[2][p]; i < mesh.W[3][p]; ++i) {
-            for (int j = mesh.W[0][p]; j < mesh.W[1][p]; ++j) {
-                std::cout << "elem_idx: " << elem_idx << ", mesh.k: " << mesh.k << "\n";  // Отладочное сообщение
-                if (elem_idx >= mesh.k) throw std::runtime_error("Выход за пределы массива.");
-                mesh.nvkat[elem_idx] = p;
-                for (int m = 0; m < NUM_NODES_PER_ELEMENT; ++m) {
-                    int row = i + (m / 3);  // Убираем умножение на 3
-                    int col = j + (m % 3);  // Убираем умножение на 3
-                    int global_index = row * mesh.xwn + col;  // Используем mesh.xwn вместо (3 * mesh.xwn - 2)
-                    std::cout << "global_index: " << global_index << ", mesh.n: " << mesh.n << "\n";  // Отладочное сообщение
-                    if (row >= mesh.ywn || col >= mesh.xwn) {
-                        mesh.nvtr[elem_idx * NUM_NODES_PER_ELEMENT + m] = -1;
-                        mesh.fict[global_index] = false;
-                    } else {
-                        mesh.nvtr[elem_idx * NUM_NODES_PER_ELEMENT + m] = global_index;
+            // Дополнительный поиск по всем парам узлов элемента
+            for (int i = 0; i < BIQUAD_NODES; ++i) {
+                for (int j = i + 1; j < BIQUAD_NODES; ++j) {
+                    int a = elem.nodes[i], b = elem.nodes[j];
+                    if ((a == n1 && b == n2) || (a == n2 && b == n1)) {
+                        return { a, -1, b }; // -1 означает отсутствие среднего узла
                     }
                 }
-                elem_idx++;
             }
         }
+        return {}; // Ребро не найдено
     }
-}
 
-void loadbc(const std::string& filename, std::vector<int>& indices, std::vector<std::pair<int, int>>& ranges, std::vector<double>& values) {
-    std::ifstream fp(filename);
-    if (!fp) throw std::runtime_error("Ошибка открытия файла " + filename);
-
-    int count;
-    fp >> count;
-    indices.resize(count);
-    ranges.resize(count);
-    values.resize(count);
-    for (int i = 0; i < count; ++i) {
-        int index, start, end;
-        double value;
-        fp >> index >> start >> end >> value;
-        indices[i] = index - 1;
-        ranges[i] = {start - 1, end - 1};
-        values[i] = value;
+    // Вычисление длины ребра
+    double calculate_edge_length(int n1, int n2) {
+        return std::hypot(nodes[n2].x - nodes[n1].x, nodes[n2].y - nodes[n1].y);
     }
-}
 
-void allocate_structure(const Mesh& mesh, CSRMatrix& A) {
-    std::vector<int> temp(mesh.n, 0);
-    for (int ielem = 0; ielem < mesh.k; ++ielem) {
-        for (int i = 0; i < NUM_NODES_PER_ELEMENT; ++i) {
-            int node_i = mesh.nvtr[ielem * NUM_NODES_PER_ELEMENT + i];
-            if (node_i == -1 || !mesh.fict[node_i]) continue;
-            for (int j = 0; j < NUM_NODES_PER_ELEMENT; ++j) {
-                int node_j = mesh.nvtr[ielem * NUM_NODES_PER_ELEMENT + j];
-                if (node_j == -1 || !mesh.fict[node_j] || node_j > node_i) continue;
-                temp[node_i]++;
-            }
+    // Функция для получения значения граничного условия (пример)
+    double get_bc_value(int func_id, double x, double y) {
+        // Реальные функции, соответствующие вашей задаче
+        switch (func_id) {
+        case 1: return x + y;          // Пример: линейная функция
+        case 2: return 2.0 * x - y;    // Пример: другая функция
+        default: return 0.0;
         }
     }
 
-    A.row_ptr.resize(mesh.n + 1);
-    A.row_ptr[0] = 0;
-    for (int i = 0; i < mesh.n; ++i) A.row_ptr[i + 1] = A.row_ptr[i] + temp[i];
-    A.nnz = A.row_ptr[mesh.n];
+public:
+    // Инициализация структуры разреженной матрицы
+    void init_sparsity() {
+        std::vector<std::set<int>> temp(nodes.size()); // Временное хранение индексов столбцов
 
-    A.col_idx.resize(A.nnz);
-    A.values.resize(A.nnz);
+        // Перебор всех элементов для заполнения шаблона матрицы
+        for (const auto& elem : elements) {
+            for (int i = 0; i < BIQUAD_NODES; ++i) {
+                int row = elem.nodes[i];
+                if (!nodes[row].is_active) continue;
 
-    std::vector<int> current(mesh.n, 0);
-    for (int ielem = 0; ielem < mesh.k; ++ielem) {
-        for (int i = 0; i < NUM_NODES_PER_ELEMENT; ++i) {
-            int row = mesh.nvtr[ielem * NUM_NODES_PER_ELEMENT + i];
-            if (row == -1 || !mesh.fict[row]) continue;
-            for (int j = 0; j < NUM_NODES_PER_ELEMENT; ++j) {
-                int col = mesh.nvtr[ielem * NUM_NODES_PER_ELEMENT + j];
-                if (col == -1 || !mesh.fict[col] || col > row) continue;
-                int pos = A.row_ptr[row] + current[row]++;
-                A.col_idx[pos] = col;
+                // Сбор индексов столбцов для текущей строки
+                for (int j = 0; j < BIQUAD_NODES; ++j) {
+                    int col = elem.nodes[j];
+                    if (nodes[col].is_active && col <= row) {
+                        temp[row].insert(col);
+                    }
+                }
+            }
+        }
+
+        // Преобразование шаблона в формат CSR
+        matrix.size = nodes.size();
+        matrix.row_ptr.push_back(0);
+        for (int i = 0; i < matrix.size; ++i) {
+            matrix.diag.push_back(0.0);
+            // Добавление индексов столбцов для строки i
+            matrix.col_idx.insert(matrix.col_idx.end(), temp[i].begin(), temp[i].end());
+            matrix.row_ptr.push_back(matrix.col_idx.size());
+        }
+        matrix.lower.resize(matrix.col_idx.size(), 0.0);
+    }
+
+    // Загрузка узлов из файла
+    void load_nodes(const std::string& filename) {
+        std::ifstream file(filename);
+        if (!file) {
+            std::cerr << "Ошибка открытия файла узлов\n";
+            return;
+        }
+
+        double dummy;
+        int n_nodes;
+        file >> dummy >> dummy >> dummy >> n_nodes; 
+
+        nodes.resize(n_nodes);
+        for (int i = 0; i < n_nodes; ++i) {
+            file >> nodes[i].x >> nodes[i].y >> nodes[i].bc_type >> nodes[i].bc_value;
+        }
+    }
+
+    // Загрузка элементов из файла
+    void load_elems(const std::string& filename) {
+        std::ifstream file(filename);
+        if (!file) {
+            std::cerr << "Ошибка открытия файла элементов\n";
+            return;
+        }
+
+        int n_elems;
+        file >> n_elems;
+        elements.resize(n_elems);
+
+        for (auto& elem : elements) {
+            for (int i = 0; i < BIQUAD_NODES; ++i) {
+                file >> elem.nodes[i];
+                if (elem.nodes[i] < 0 || elem.nodes[i] >= nodes.size()) {
+                    std::cerr << "Неверный индекс узла: " << elem.nodes[i] << "\n";
+                    exit(1);
+                }
+            }
+            // Чтение параметров gamma
+            for (int i = 0; i < BILIN_NODES; ++i) file >> elem.gamma[i];
+        }
+    }
+
+    // Загрузка граничных условий из файла
+    void load_bc(const std::string& filename, int bc_type) {
+        std::ifstream file(filename);
+        if (!file) return;
+
+        int n_edges;
+        file >> n_edges;
+
+        for (int i = 0; i < n_edges; ++i) {
+            EdgeBC bc;
+            if (bc_type == 1 || bc_type == 2) {
+                file >> bc.node1 >> bc.node2 >> bc.func_id;
+            }
+            else if (bc_type == 3) {
+                file >> bc.node1 >> bc.node2 >> bc.func_id >> bc.beta;
+            }
+            // Добавление в соответствующий список условий
+            auto& target = (bc_type == 1) ? bc_first :
+                (bc_type == 2) ? bc_second : bc_third;
+            target.push_back(bc);
+        }
+    }
+
+    // Применение граничных условий
+    void apply_boundary_conditions() {
+        solution.resize(nodes.size(), 0.0);
+        rhs.resize(nodes.size(), 0.0);
+
+        // Условия Дирихле (используем bc_value из узлов)
+        for (const auto& bc : bc_first) {
+            auto edge_nodes = get_edge_nodes(bc.node1, bc.node2);
+            if (edge_nodes.empty()) {
+                std::cerr << "Предупреждение: Ребро " << bc.node1 << "-" << bc.node2 << " не найдено\n";
+                continue;
+            }
+
+            // Фиксируем узлы и задаем значения из nodes.bc_value
+            for (int node : edge_nodes) {
+                if (node < 0 || node >= nodes.size()) continue;
+                nodes[node].is_active = false;
+                solution[node] = nodes[node].bc_value; // Прямое значение из файла
+            }
+        }
+
+        // Условия Неймана (интегрируем нагрузку)
+        for (const auto& bc : bc_second) {
+            auto edge_nodes = get_edge_nodes(bc.node1, bc.node2);
+            if (edge_nodes.empty()) continue;
+
+            double length = calculate_edge_length(edge_nodes[0], edge_nodes[2]);
+            for (int gi = 0; gi < GAUSS_POINTS; ++gi) {
+                double xi = gauss_points[gi];
+                double weight = gauss_weights[gi];
+                double N[3] = { 0.5 * xi * (xi - 1), 1.0 - xi * xi, 0.5 * xi * (xi + 1) };
+
+                for (int i = 0; i < 3; ++i) {
+                    int node = edge_nodes[i];
+                    if (node >= nodes.size() || !nodes[node].is_active) continue;
+                    // Вычисляем значение нагрузки в координатах узла
+                    double x = nodes[node].x;
+                    double y = nodes[node].y;
+                    rhs[node] += get_bc_value(bc.func_id, x, y) * N[i] * weight * (length / 2.0);
+                }
+            }
+        }
+
+        // Условия Робина (матрица + правая часть)
+        for (const auto& bc : bc_third) {
+            auto edge_nodes = get_edge_nodes(bc.node1, bc.node2);
+            if (edge_nodes.empty()) continue;
+
+            double length = calculate_edge_length(edge_nodes[0], edge_nodes[2]);
+            for (int gi = 0; gi < GAUSS_POINTS; ++gi) {
+                double xi = gauss_points[gi];
+                double weight = gauss_weights[gi];
+                double N[3] = { 0.5 * xi * (xi - 1), 1.0 - xi * xi, 0.5 * xi * (xi + 1) };
+
+                // Правая часть
+                for (int i = 0; i < 3; ++i) {
+                    int row = edge_nodes[i];
+                    if (row >= nodes.size() || !nodes[row].is_active) continue;
+                    double x = nodes[row].x;
+                    double y = nodes[row].y;
+                    rhs[row] += get_bc_value(bc.func_id, x, y) * N[i] * weight * (length / 2.0);
+                }
+
+                // Матрица (beta * N_i * N_j)
+                for (int i = 0; i < 3; ++i) {
+                    int row = edge_nodes[i];
+                    if (row >= nodes.size() || !nodes[row].is_active) continue;
+
+                    for (int j = 0; j < 3; ++j) {
+                        int col = edge_nodes[j];
+                        if (col >= nodes.size() || !nodes[col].is_active || col > row) continue;
+
+                        double val = bc.beta * N[i] * N[j] * weight * (length / 2.0);
+                        if (row == col) {
+                            matrix.diag[row] += val;
+                        }
+                        else {
+                            auto it = std::lower_bound(
+                                matrix.col_idx.begin() + matrix.row_ptr[row],
+                                matrix.col_idx.begin() + matrix.row_ptr[row + 1],
+                                col
+                            );
+                            if (it != matrix.col_idx.end() && *it == col) {
+                                int idx = it - matrix.col_idx.begin();
+                                matrix.lower[idx] += val;
+                            }
+                        }
+                    }
+                }
             }
         }
     }
-}
+    // Сборка глобальной матрицы и правой части
+    void assemble_system() {
+        rhs.assign(nodes.size(), 0.0);
+        matrix.diag.assign(nodes.size(), 0.0);
+        matrix.lower.assign(matrix.lower.size(), 0.0);
 
-void add_local_to_global(int ielem, const std::vector<double>& Ak, const std::vector<double>& Bk, const Mesh& mesh, CSRMatrix& A, std::vector<double>& b) {
-    for (int i = 0; i < NUM_NODES_PER_ELEMENT; ++i) {
-        int row = mesh.nvtr[ielem * NUM_NODES_PER_ELEMENT + i];
-        if (row == -1 || !mesh.fict[row]) continue;
-        for (int j = 0; j < NUM_NODES_PER_ELEMENT; ++j) {
-            int col = mesh.nvtr[ielem * NUM_NODES_PER_ELEMENT + j];
-            if (col == -1 || !mesh.fict[col]) continue;
-            auto it = std::lower_bound(A.col_idx.begin() + A.row_ptr[row], A.col_idx.begin() + A.row_ptr[row + 1], col);
-            if (it != A.col_idx.begin() + A.row_ptr[row + 1] && *it == col) {
-                A.values[std::distance(A.col_idx.begin(), it)] += Ak[i * NUM_NODES_PER_ELEMENT + j];
+        // Перебор всех элементов
+        for (const auto& elem : elements) {
+            double Ke[BIQUAD_NODES][BIQUAD_NODES] = { 0 }; // Локальная матрица
+            double Fe[BIQUAD_NODES] = { 0 };               // Локальный вектор
+
+            // Интегрирование по Гауссу
+            for (int gi = 0; gi < GAUSS_POINTS; ++gi) {
+                for (int gj = 0; gj < GAUSS_POINTS; ++gj) {
+                    double xi = gauss_points[gi], eta = gauss_points[gj];
+                    double w = gauss_weights[gi] * gauss_weights[gj];
+
+                    // Вычисление якобиана преобразования
+                    double J[2][2] = { 0 };
+                    for (int k = 0; k < BIQUAD_NODES; ++k) {
+                        double dx, dy;
+                        biquadratic_grad(xi, eta, k, dx, dy);
+                        J[0][0] += dx * nodes[elem.nodes[k]].x;
+                        J[0][1] += dx * nodes[elem.nodes[k]].y;
+                        J[1][0] += dy * nodes[elem.nodes[k]].x;
+                        J[1][1] += dy * nodes[elem.nodes[k]].y;
+                    }
+
+                    double detJ = J[0][0] * J[1][1] - J[0][1] * J[1][0];
+                    detJ = std::abs(detJ); // Модуль определителя
+
+                    if (detJ < EPS) { // Пропуск точек с малым якобианом
+                        std::cerr << "Пропуск точки интегрирования (" << xi << ", " << eta
+                            << ") из-за малого detJ: " << detJ << "\n";
+                        continue;
+                    }
+
+                    // Вычисление градиентов базисных функций
+                    double dN[BIQUAD_NODES][2];
+                    for (int k = 0; k < BIQUAD_NODES; ++k) {
+                        double dxi, deta;
+                        biquadratic_grad(xi, eta, k, dxi, deta);
+                        // Преобразование градиентов в глобальные координаты
+                        dN[k][0] = (J[1][1] * dxi - J[0][1] * deta) / detJ;
+                        dN[k][1] = (-J[1][0] * dxi + J[0][0] * deta) / detJ;
+                    }
+
+                    // Вклад в локальную матрицу и вектор
+                    for (int i = 0; i < BIQUAD_NODES; ++i) {
+                        // Вычисляем глобальные координаты (x, y) для точки интегрирования
+                        double x = 0.0, y = 0.0;
+                        for (int k = 0; k < BIQUAD_NODES; ++k) {
+                            double Nk = biquadratic_basis(xi, eta, k);
+                            x += Nk * nodes[elem.nodes[k]].x;
+                            y += Nk * nodes[elem.nodes[k]].y;
+                        }
+                        for (int j = 0; j < BIQUAD_NODES; ++j) {
+                            double gamma_avg = 0.0;
+                            for (int k = 0; k < BILIN_NODES; ++k) {
+                                gamma_avg += elem.gamma[k] * bilinear_basis(xi, eta, k);
+                            }
+                            Ke[i][j] += gamma_avg * (dN[i][0] * dN[j][0] + dN[i][1] * dN[j][1]) * w * detJ;
+                        }
+
+                        Fe[i] += get_bc_value(2, x, y) * biquadratic_basis(xi, eta, i) * w * detJ;
+                    }
+                }
+
+            }
+
+            // Перенос локальных вкладов в глобальную систему
+            for (int i = 0; i < BIQUAD_NODES; ++i) {
+                int row = elem.nodes[i];
+                if (!nodes[row].is_active) continue;  // Пропуск неактивных
+
+                rhs[row] += Fe[i]; // Добавление в правую часть
+                for (int j = 0; j < BIQUAD_NODES; ++j) {
+                    int col = elem.nodes[j];
+                    if (col > row || !nodes[col].is_active) continue;
+
+                    if (col == row) {
+                        matrix.diag[row] += Ke[i][j]; // Диагональный элемент
+                    }
+                    else {
+                        // Поиск позиции в разреженной матрице
+                        auto it = std::lower_bound(
+                            matrix.col_idx.begin() + matrix.row_ptr[row],
+                            matrix.col_idx.begin() + matrix.row_ptr[row + 1],
+                            col
+                        );
+                        if (it != matrix.col_idx.end() && *it == col) {
+                            int idx = it - matrix.col_idx.begin();
+                            matrix.lower[idx] += Ke[i][j]; // Внедиагональный элемент
+                        }
+                    }
+                }
             }
         }
-        b[row] += Bk[i];
     }
 
-    // Дополнительные отладочные сообщения
-    if (ielem == 0) {
-        std::cout << "Первые 5 строк глобальной матрицы A:\n";
-        for (int i = 0; i < 5; ++i) {
-            for (int j = A.row_ptr[i]; j < A.row_ptr[i + 1]; ++j) {
-                std::cout << A.values[j] << " ";
+    // Решение СЛАУ методом сопряженных градиентов
+    void solve() {
+        solution.resize(nodes.size(), 0.0);
+        std::vector<double> r = rhs; // Вектор невязки
+        std::vector<double> p = r;   // Направление поиска
+        std::vector<double> Ap(nodes.size(), 0.0); // Вектор A*p
+
+        double rr_old = 0.0;         // Квадрат нормы невязки
+        bool converged = false;      // Флаг сходимости
+
+        // Вычисление начальной невязки
+        for (size_t i = 0; i < r.size(); ++i) {
+            if (std::isnan(r[i]) || std::isinf(r[i])) {
+                std::cerr << "Ошибка: Некорректное значение в невязке (r)!\n";
+                exit(1);
             }
-            std::cout << "\n";
+            rr_old += r[i] * r[i];
         }
-        std::cout << "Первые 5 значений вектора правой части b:\n";
-        for (int i = 0; i < 5; ++i) {
-            std::cout << b[i] << " ";
+
+        if (std::sqrt(rr_old) < params.tolerance) {
+            std::cout << "Решение уже сошлось (начальная невязка).\n";
+            return;
         }
-        std::cout << "\n";
-    }
-}
 
-
-void LOS_solve(const CSRMatrix& A, const std::vector<double>& b, std::vector<double>& x, int max_iter, double tol) {
-    int n = A.n;
-    std::vector<double> r(n, 0.0), z(n, 0.0), p(n, 0.0), Ap(n, 0.0), Az(n, 0.0);
-    x.assign(n, 0.0);
-    r = b;
-    z = r;
-    p = r;
-    double r_norm = 0.0;
-    for (int i = 0; i < n; ++i) r_norm += r[i] * r[i];
-    r_norm = std::sqrt(r_norm);
-    for (int iter = 0; iter < max_iter; ++iter) {
-        for (int i = 0; i < n; ++i) {
-            Ap[i] = 0.0;
-            for (int j = A.row_ptr[i]; j < A.row_ptr[i + 1]; ++j) {
-                Ap[i] += A.values[j] * p[A.col_idx[j]];
+        // Итерации метода сопряженных градиентов
+        for (int iter = 0; iter < params.max_iter; ++iter) {
+            // Вычисление Ap = A * p
+            std::fill(Ap.begin(), Ap.end(), 0.0);
+            for (int i = 0; i < matrix.size; ++i) {
+                if (!nodes[i].is_active) continue;
+                Ap[i] += matrix.diag[i] * p[i];
+                for (int j = matrix.row_ptr[i]; j < matrix.row_ptr[i + 1]; ++j) {
+                    Ap[i] += matrix.lower[j] * p[matrix.col_idx[j]];
+                    // Симметричная часть для верхнего треугольника
+                    if (matrix.col_idx[j] < i && nodes[matrix.col_idx[j]].is_active) {
+                        Ap[matrix.col_idx[j]] += matrix.lower[j] * p[i];
+                    }
+                }
             }
-        }
-        double alpha = 0.0, pAp = 0.0;
-        for (int i = 0; i < n; ++i) {
-            alpha += r[i] * z[i];
-            pAp += p[i] * Ap[i];
-        }
-        if (std::abs(pAp) < EPSILON) {
-            throw std::runtime_error("pAp близко к нулю.");
-        }
-        alpha /= pAp;
-        for (int i = 0; i < n; ++i) {
-            x[i] += alpha * p[i];
-            r[i] -= alpha * Ap[i];
-        }
-        double r_new_norm = 0.0;
-        for (int i = 0; i < n; ++i) r_new_norm += r[i] * r[i];
-        r_new_norm = std::sqrt(r_new_norm);
-        std::cout << "Итерация " << iter + 1 << ": r_norm = " << r_new_norm << "\n";
-        if (r_new_norm < tol * r_norm) {
-            std::cout << "Сходимость за " << iter + 1 << " итераций.\n";
-            break;
-        }
-        for (int i = 0; i < n; ++i) {
-            Az[i] = 0.0;
-            for (int j = A.row_ptr[i]; j < A.row_ptr[i + 1]; ++j) {
-                Az[i] += A.values[j] * z[A.col_idx[j]];
+
+            // Вычисление шага alpha
+            double pAp = 0.0;
+            for (size_t i = 0; i < p.size(); ++i) {
+                if (!nodes[i].is_active) continue;
+                pAp += p[i] * Ap[i];
             }
-        }
-        double beta = 0.0, AzAz = 0.0;
-        for (int i = 0; i < n; ++i) {
-            beta += r[i] * Az[i];
-            AzAz += Az[i] * Az[i];
-        }
-        if (std::abs(AzAz) < EPSILON) {
-            throw std::runtime_error("AzAz близко к нулю.");
-        }
-        beta /= AzAz;
-        for (int i = 0; i < n; ++i) {
-            z[i] = r[i] - beta * Az[i];
-            p[i] = z[i] + beta * p[i];
-        }
-    }
-}
-void assemble_system(const Mesh& mesh, const BoundaryCondition& bc, CSRMatrix& A, std::vector<double>& b) {
-    allocate_structure(mesh, A);
-    b.assign(mesh.n, 0.0);
 
-    for (int ielem = 0; ielem < mesh.k; ++ielem) {
-        std::vector<double> element_x(NUM_NODES_PER_ELEMENT), element_y(NUM_NODES_PER_ELEMENT);
-        for (int i = 0; i < NUM_NODES_PER_ELEMENT; ++i) {
-            int node = mesh.nvtr[ielem * NUM_NODES_PER_ELEMENT + i];
-            if (node == -1 || !mesh.fict[node]) continue;
-            element_x[i] = mesh.xy_x[node];
-            element_y[i] = mesh.xy_y[node];
-        }
-
-        // Вычисляем шаг сетки для текущего элемента
-        double hx = element_x[2] - element_x[0];
-        double hy = element_y[6] - element_y[0];
-        if (hx <= 0 || hy <= 0) throw std::runtime_error("Нулевой или отрицательный шаг сетки.");
-
-        double lambdak = lambda_func(element_x[4], element_y[4]);
-        double gammak = 0.0;
-        for (int i = 0; i < NUM_NODES_PER_ELEMENT; ++i) {
-            if (mesh.nvtr[ielem * NUM_NODES_PER_ELEMENT + i] == -1) continue;
-            double xi = (element_x[i] - element_x[0]) / hx, eta = (element_y[i] - element_y[0]) / hy;
-            gammak += gamma_func(element_x[i], element_y[i]) * bilinear_basis_function(xi, eta, i % 4);
-        }
-        gammak /= NUM_NODES_PER_ELEMENT;
-
-        double k1 = lambdak * hy / hx, k2 = lambdak * hx / hy, k3 = gammak * hx * hy;
-
-        std::vector<double> Ak(NUM_NODES_PER_ELEMENT * NUM_NODES_PER_ELEMENT);
-        for (int i = 0; i < NUM_NODES_PER_ELEMENT; ++i) {
-            for (int j = 0; j < NUM_NODES_PER_ELEMENT; ++j) {
-                Ak[i * NUM_NODES_PER_ELEMENT + j] = k1 * calculate_G(i, j, element_x[4], element_y[4]) +
-                                                     k2 * calculate_C(i, j, element_x[4], element_y[4]) +
-                                                     k3 * calculate_Ck(i, j, element_x[4], element_y[4]);
-            }
-        }
-
-        std::vector<double> Bk(NUM_NODES_PER_ELEMENT);
-        double k_area = hx * hy;
-        for (int i = 0; i < NUM_NODES_PER_ELEMENT; ++i) {
-            int node = mesh.nvtr[ielem * NUM_NODES_PER_ELEMENT + i];
-            if (node == -1) continue;
-            Bk[i] = f_func(element_x[i], element_y[i]) * k_area;
-        }
-
-        // Отладочное сообщение: выводим локальную матрицу и вектор правой части
-        std::cout << "Локальная матрица Ak для элемента " << ielem << ":\n";
-        for (int i = 0; i < NUM_NODES_PER_ELEMENT; ++i) {
-            for (int j = 0; j < NUM_NODES_PER_ELEMENT; ++j) {
-                std::cout << Ak[i * NUM_NODES_PER_ELEMENT + j] << " ";
-            }
-            std::cout << "\n";
-        }
-
-        std::cout << "Локальный вектор правой части Bk для элемента " << ielem << ":\n";
-        for (int i = 0; i < NUM_NODES_PER_ELEMENT; ++i) {
-            std::cout << Bk[i] << " ";
-        }
-        std::cout << "\n";
-
-        add_local_to_global(ielem, Ak, Bk, mesh, A, b);
-    }
-
-    // Применяем граничные условия
-    for (size_t i = 0; i < bc.kt1.size(); ++i) {
-        int ind = bc.l1[i].first;
-        if (ind < 0 || ind >= mesh.n) throw std::runtime_error("Некорректный индекс узла.");
-        double u_val = bc.kt1_values[i];
-
-        // Отладочное сообщение: выводим изменения в глобальной матрице и векторе правой части
-        std::cout << "Применяем граничное условие Дирихле для узла " << ind << " со значением " << u_val << "\n";
-
-        for (int j = A.row_ptr[ind]; j < A.row_ptr[ind + 1]; ++j) A.values[j] = 0.0;
-        for (int j = A.row_ptr[ind]; j < A.row_ptr[ind + 1]; ++j) {
-            if (A.col_idx[j] == ind) {
-                A.values[j] = 1.0;
+            if (std::abs(pAp) < EPS) {
+                std::cerr << "Ошибка: Деление на ноль (pAp = " << pAp << ")\n";
                 break;
             }
+            double alpha = rr_old / pAp;
+
+            // Обновление решения и невязки
+            for (size_t i = 0; i < solution.size(); ++i) {
+                if (!nodes[i].is_active) continue;
+                solution[i] += alpha * p[i];
+                r[i] -= alpha * Ap[i];
+                if (std::isnan(solution[i])) {
+                    std::cerr << "NaN в решении на итерации " << iter << "\n";
+                    exit(1);
+                }
+            }
+
+            // Проверка нормы новой невязки
+            double rr_new = 0.0;
+            for (double val : r) rr_new += val * val;
+
+            if (std::sqrt(rr_new) < params.tolerance) {
+                std::cout << "Сходимость достигнута за " << iter << " итераций.\n";
+                converged = true;
+                break;
+            }
+
+            // Вычисление коэффициента beta
+            if (rr_old < EPS) {
+                std::cerr << "Ошибка: Деление на ноль (rr_old = " << rr_old << ")\n";
+                break;
+            }
+            double beta = rr_new / rr_old;
+
+            // Обновление направления поиска
+            for (size_t i = 0; i < p.size(); ++i) {
+                if (!nodes[i].is_active) continue;
+                p[i] = r[i] + beta * p[i];
+            }
+
+            rr_old = rr_new;
         }
-        b[ind] = u_val;
+
+        if (!converged) {
+            std::cerr << "Сходимость не достигнута за " << params.max_iter << " итераций.\n";
+        }
     }
-}
+
+    // Сохранение результатов в CSV-файл
+    void save_results(const std::string& filename) {
+        std::ofstream file(filename);
+        file << "x,y,u\n";
+        for (size_t i = 0; i < nodes.size(); ++i) {
+            file << nodes[i].x << "," << nodes[i].y << "," << solution[i] << "\n";
+        }
+    }
+};
+
 int main() {
-    try {
-        std::setlocale(LC_ALL, "Russian");
-        Mesh mesh;
-        BoundaryCondition bc;
-        loadnet("st.txt", mesh);
-        loadbc("ku1.txt", bc.kt1, bc.l1, bc.kt1_values);
-        loadbc("ku2.txt", bc.nvk2, bc.nvr2, bc.nvk2_values);
-        loadbc("ku3.txt", bc.nvk3, bc.nvr3, bc.nvk3_values);
-        CSRMatrix A(mesh.n);
-        std::vector<double> b(mesh.n, 0.0);
-        assemble_system(mesh, bc, A, b);
-        std::vector<double> x(mesh.n, 0.0);
-        LOS_solve(A, b, x, MAX_ITER, EPSILON); 
-        std::ofstream fp("q.txt");
-        if (!fp) throw std::runtime_error("Ошибка открытия файла q.txt.");
-        for (const auto& val : x) fp << val << "\t";
-        fp.close();
-        std::cout << "Решение записано в файл q.txt\n";
-    } catch (const std::exception& e) {
-        std::cerr << "Ошибка: " << e.what() << "\n";
-        return EXIT_FAILURE;
-    }
+    setlocale(LC_ALL, "RU"); 
+    FEMSolver solver;
+    solver.load_nodes("nodes.txt");     // Загрузка узлов
+    solver.load_elems("elems.txt");     // Загрузка элементов
+    solver.load_bc("first.txt", 1);     // Условия Дирихле
+    solver.load_bc("second.txt", 2);    // Условия Неймана
+    solver.load_bc("third.txt", 3);     // Условия Робина
+    solver.init_sparsity();             // Инициализация разреженности
+    solver.apply_boundary_conditions(); // Применение граничных условий
+    solver.assemble_system();           // Сборка системы
+    solver.solve();                     // Решение СЛАУ
+    solver.save_results("results.csv"); // Сохранение результатов
     return 0;
 }
