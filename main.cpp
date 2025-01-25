@@ -156,8 +156,8 @@ private:
     double get_bc_value(int func_id, double x, double y) {
         // Реальные функции, соответствующие вашей задаче
         switch (func_id) {
-        case 1: return x + y;          // Пример: линейная функция
-        case 2: return 2.0 * x - y;    // Пример: другая функция
+        case 1: return x + y;         
+        case 2: return 2 * 3.14 * 3.14 * sin(3.14 * x) * sin(3.14 * y);
         default: return 0.0;
         }
     }
