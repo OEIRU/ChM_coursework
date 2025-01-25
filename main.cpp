@@ -3,7 +3,7 @@
 #include <vector>
 #include <cmath>
 #include <algorithm>
-#include <set>  // Используется для эффективного хранения уникальных индексов столбцов
+#include <set>
 #include <clocale>
 
 // Константы, определяющие параметры задачи
